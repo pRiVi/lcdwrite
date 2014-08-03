@@ -1,0 +1,485 @@
+//convert stream to bit for writing to display
+#include <sys/types.h>
+#include <sys/gpio.h>
+#include <sys/ioctl.h>
+
+#include <err.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+#define _PATH_DEV_GPIO  "/dev/gpio1"
+
+#define ARRAY_LEN(x) (sizeof(x) / sizeof ((x) [0]))
+
+/* Tastenbelegung */
+const taste1 = 4;
+const taste2 = 5;
+const taste3 = 10;
+const taste4 = 11;
+
+/* LDC Belegung */
+const data3 = 16;
+const data2 = 17;
+const data1 = 18;
+const data0 = 19;
+const rs    = 20;
+const rw    = 21;
+const en    = 22;
+const curms = 2;
+
+/* Funktionsbelegung */
+#define runter taste1
+#define rauf taste2
+#define links taste3
+#define rechts taste4
+
+char *device = _PATH_DEV_GPIO;
+int devfd = -1;
+
+void     waitms(int);
+void     pinwrite(int, int);
+void     pinmode(int, int);
+void     trans4bit(int, int, int, int);
+void     trans8bit(int, int, int, int, int, int, int, int);
+void     cmd(int, int, int, int, int, int, int, int, int);
+void     lcd2line();
+void     lcd1line();
+void     writeChar(char);
+void     writeString (char*,int,int);
+void     initLCD(int, int);
+void     initTasten();
+int      pinread(int);
+int      timeChanged(long*, int);
+long     getTime();
+void     moveCursor(int);
+
+static char* MENU[] = {
+   "IP-Adresse",
+   "Reboot",
+   "Version",
+   "Statusinformation",
+   "Letzte Logmeldung"
+};
+
+int reinitSeconds = 5;
+int pollMS = 10;
+
+struct screendef {
+   char* show;
+   int cursorposition;
+   int cursorblink;
+   char* buttons[];
+};
+
+void cmd(int a, int b, int c, int d, int e, int f, int g, int h, int nosleep) {
+   pinwrite(rs, 0);
+   trans8bit(a,b,c,d,e,f,g,h);
+   if (nosleep == 0) waitms(curms);
+}
+
+void cursorHome() { 
+/*    # 0,0,0,0,0,0,1,* -> Cursor home
+      # Setzt den Cursor auf Adresse 0 und bringt eine gescrollte Displayanzeige
+      # zurück auf 0. Der RAM-Inhalt bleibt dabei unverändert. */
+      cmd(0,0,0,0,0,0,0,1,0);
+}
+
+void clearDisplay() {
+/*    # 0,0,0,0,0,0,0,1 -> Clear display
+      # Clear display: Löscht das Display und setzt den Cursor zurück auf Adresse 0 */
+      cmd(0,0,0,0,0,0,1,1,0);
+}
+
+struct screendef* handler(int taste, struct screendef* oldscreen) {
+   static int menupos = 0;
+   if ((int) (*oldscreen).show != 0) free((*oldscreen).show);
+   free(oldscreen);
+   struct screendef* screen = malloc(sizeof(*screen));
+   bzero(screen, sizeof(*screen));
+
+   if ((taste == runter) && (menupos < (ARRAY_LEN(MENU)-1))) {
+      menupos++;
+   } else if ((taste == rauf) && (menupos > 0)) {
+      menupos--;
+   } else if (taste == -1) {
+      /* Einfach mal was ausgeben, sonst nix. */
+   }
+
+   char* newstring = MENU[menupos];
+   (*screen).show = malloc(strlen(newstring)+1);
+   strncpy((*screen).show, newstring, (strlen(newstring)+1) );
+   (*screen).cursorposition = strlen((*screen).show)+1;
+   return screen;
+}
+
+struct screendef* edithandler(int taste, struct screendef* oldscreen) {
+   static char* edittext[255];
+   if ((int) (*oldscreen).show != 0) free((*oldscreen).show);
+   free(oldscreen);
+   struct screendef* screen = malloc(sizeof(*screen));
+   bzero(screen, sizeof(*screen));
+
+   if (taste == runter);
+
+   char* newstring = "Dummy.";
+
+   (*screen).show = malloc(strlen(newstring)+1);
+   strncpy((*screen).show, newstring, (strlen(newstring)+1) );
+   (*screen).cursorposition = strlen((*screen).show)+1;
+   return screen;
+}
+
+int main (int argc, char *argv[]) {
+   if ((devfd = open(device, O_RDWR)) == -1) {
+      err(1, "%s", device);
+   }
+   initLCD(1,1);
+   initTasten();
+   
+   long lasttime = 0;
+
+   struct screendef* screen;
+   screen = malloc(sizeof(*screen));
+   bzero(screen, sizeof(screen));
+ 
+   int lastTaste = 0;
+   long lastcursor = 0;
+   int block = 0;
+   int cursorposition = 0;
+   int cursorBlinkRate = 1;
+   int curState = 0;
+
+   screen = handler(-1, screen);
+   int needreprint = 1;
+
+   while (1) {
+      waitms(pollMS);
+      if (timeChanged(&lasttime, reinitSeconds)) {
+         initLCD(1,1);
+         printf("Resetting Display...\n");
+         needreprint = 1;
+      }
+      if ((*screen).cursorposition && (timeChanged(&lastcursor, cursorBlinkRate))) {
+         curState = curState ? 0 : 1;
+         needreprint = 1;
+      }
+      int activeTaste = 0;
+      if (pinread(taste1) == 0) {
+         activeTaste = taste1;
+      }
+      if (pinread(taste2) == 0) {
+         if (activeTaste) { lastTaste = 0; block = 1; continue; }
+         activeTaste = taste2;
+      }
+      if (pinread(taste3) == 0) {
+         if (activeTaste) { lastTaste = 0; block = 1; continue; }
+         activeTaste = taste3;
+      }
+      if (pinread(taste4) == 0) {
+         if (activeTaste) { lastTaste = 0; block = 1; continue; }
+         activeTaste = taste4;
+      }
+      if (activeTaste) {
+         if (lastTaste && (lastTaste != activeTaste)) {
+            lastTaste = 0; block = 1; continue;
+         }
+         if (block == 0) lastTaste = activeTaste;
+         continue;
+      } else {
+         if (lastTaste) {
+             screen = handler(lastTaste, screen);
+             /* Wir haben mit dem Benutzer interagiert, ein Reset des
+                Displays ist im Moment nicht notwendig. Darum last
+                zurücksetzen. */
+             lasttime = getTime(0);
+             needreprint = 1;
+             lastTaste = 0;
+         }
+         if (block) printf("Unblocked.\n");
+         block = 0;
+      }
+      if (needreprint != 0) {
+         writeString((*screen).show,(*screen).cursorposition,(curState));
+         needreprint = 0;
+      }
+   }
+}
+
+void waitms(int ms) {
+   struct timeval blubb;
+   bzero(&blubb, sizeof(blubb));
+   blubb.tv_sec = 0;
+   blubb.tv_usec = ms;
+   select(NULL,NULL,NULL,NULL,&blubb);
+}
+
+/* Diese Funktion ist boese, weil sie auch einen Reset des
+   Displays ueberlebt. Dann ist alles verschoben. Aus diesem
+   Grunde haben wir eine eigene Cursorimplementierung. */
+/* ALSO NIEMALS DIESE FUNKTION AUFRUFEN!!! */
+void moveCursor(int direction) {
+/* # 0,0,0,1,x,x,*,* -> Cursor/display shift
+   # Bestimmt, ob der Cursor verschoben oder das Display gescrollt werden
+   # soll (DisplayMove) und in welcher Richtung das geschieht
+   # (DisplayMoveDirection). Der RAM-Inhalt bleibt unverändert. */
+   cmd(0,0,0,1,0,direction,0,0,1); 
+}
+
+void initLCD(int full, int clear) {
+
+   /* First set up right modes, which are for each pin one of...
+
+      GPIO_PIN_INPUT      input direction
+      GPIO_PIN_OUTPUT     output direction
+      GPIO_PIN_INOUT      bi-directional
+      GPIO_PIN_OPENDRAIN  open-drain output
+      GPIO_PIN_PUSHPULL   push-pull output
+      GPIO_PIN_TRISTATE   output disabled
+      GPIO_PIN_PULLUP     internal pull-up enabled
+   */
+
+   pinmode(en, GPIO_PIN_PUSHPULL);
+   pinmode(rs, GPIO_PIN_PUSHPULL);
+   pinmode(rw, GPIO_PIN_PUSHPULL);
+   pinwrite(en, 0);
+   pinwrite(rs, 0);
+   pinwrite(rw, 0);
+
+   pinmode(data0, GPIO_PIN_PUSHPULL);
+   pinmode(data1, GPIO_PIN_PUSHPULL);
+   pinmode(data2, GPIO_PIN_PUSHPULL);
+   pinmode(data3, GPIO_PIN_PUSHPULL);
+
+   pinwrite(en, 0);
+   pinwrite(rs, 0);
+   pinwrite(rw, 0);
+
+   int eightbitmode = 0; /* # 0 = 4 bit, 1 = 8 bit */
+   int DisplayLines = 1; /* # 0 = 1 Zeile, 1 = 2 Zeilen */
+   int SchriftArt = 0; /* # ...sofern unterstützt. */
+   int DisplayAn = 1;
+   int CursorAnzeigen = 0;
+   int CursorBlink = 0;  
+   int CursorBewegung = 1; 
+   int CursorDisplayScroll = 0;
+
+/* # 3 x 0,0,1,1(,*,*,*,*) -> RESET
+   # Da wir die HighBits kontrollieren, koennen wir
+   # auch hier schon reseten, und auf 4 Bit setzen
+   # 0,0,1,x(,x,x,*,*) -> Function set */
+   trans4bit(0,0,1,1);
+   trans4bit(0,0,1,1);
+   trans4bit(0,0,1,1);
+/* # 0,0,1,x(,x,x,*,*) -> Function set
+   # Setzt den Übertragungsmodus (eightbitmode), die Anzahl der
+   # Displayzeilen (DisplayLines) und die Schriftart (SchriftArt),
+   # sofern unterstützt. */
+   trans4bit(0,0,1,eightbitmode);
+   cmd(0,0,1,eightbitmode,DisplayLines,SchriftArt,0,0,1);
+/* # 0,0,0,0,1,x,x,x -> Display On/Off control
+   # Schaltet das Display ein (DisplayAn), den Cursor sichtbar
+   # (CursorAnzeigen) und bestimmt, ob der Cursor blinken soll
+   # (CursorBlink) */
+   cmd(0,0,0,0,1,DisplayAn,CursorAnzeigen,CursorBlink,1);
+/* # 0,0,0,0,0,1,x,x -> Entry mode set
+   # Setzt die Cursor-Bewegungsrichtung(CursorBewegung), und ob
+   # das Display mitscrollt (CursorDisplayScroll) */
+/*   cmd(0,0,0,0,0,1,CursorBewegung,CursorDisplayScroll,0); */
+   if (clear == 0) {
+      clearDisplay;
+   } else {
+      cursorHome;
+   }
+   return;
+
+   if (full == 0) return;
+
+/* # Umlaute deklarieren
+   # set CGRAM address1
+   # Set the CG RAM address by sending an instruction byte of 64 */
+   trans8bit(0,1,0,0,0,0,0,0);
+/* # switch to data mode */
+   pinwrite(rs, 1);
+/* # define pattern Ä */
+   trans8bit(0,0,0,0,1,0,1,0);
+   trans8bit(0,0,0,0,0,1,0,0);
+   trans8bit(0,0,0,0,1,0,1,0);
+   trans8bit(0,0,0,1,0,0,0,1);
+   trans8bit(0,0,0,1,1,1,1,1);
+   trans8bit(0,0,0,1,0,0,0,1);
+   trans8bit(0,0,0,1,0,0,0,1);
+   trans8bit(0,0,0,0,0,0,0,0); /* # reserviert f. cursor */
+
+/* # set CGRAM address2 */
+   pinwrite(rs, 0);
+/* # Set the CG RAM address by sending an instruction byte of 72 */
+   trans8bit(0,1,0,0,1,0,0,0);
+
+/* # switch to data mode */
+   pinwrite(rs, 1);
+/* # define pattern Ö */
+   trans8bit(0,0,0,0,1,0,1,0);
+   trans8bit(0,0,0,0,0,0,0,0);
+   trans8bit(0,0,0,0,1,1,1,0);
+   trans8bit(0,0,0,1,0,0,0,1);
+   trans8bit(0,0,0,1,0,0,0,1);
+   trans8bit(0,0,0,1,0,0,0,1);
+   trans8bit(0,0,0,0,1,1,1,0);
+   trans8bit(0,0,0,0,0,0,0,0);
+
+/* # set CGRAM address3 */
+   pinwrite(rs, 0);
+/* # Set the CG RAM address by sending an instruction byte of 80 */
+   trans8bit(0,1,0,1,0,0,0,0);
+
+/* # switch to data mode */
+   pinwrite(rs, 1);
+   # define pattern ü
+   trans8bit(0,0,0,0,0,0,0,0);
+   trans8bit(0,0,0,0,1,0,1,0);
+   trans8bit(0,0,0,0,0,0,0,0);
+   trans8bit(0,0,0,1,0,0,0,1);
+   trans8bit(0,0,0,1,0,0,0,1);
+   trans8bit(0,0,0,1,0,0,1,1);
+   trans8bit(0,0,0,0,1,1,0,1);
+   trans8bit(0,0,0,0,0,0,0,0);
+
+/* # set CGRAM address4 */
+   pinwrite(rs, 0);
+/* # Set the CG RAM address by sending an instruction byte of 88 */
+   trans8bit(0,1,0,1,1,0,0,0);
+
+/* # switch to data mode */
+   pinwrite(rs, 1);
+/* # define arrow_up | */
+   trans8bit(0,0,0,0,0,1,0,0);
+   trans8bit(0,0,0,0,1,1,1,0);
+   trans8bit(0,0,0,1,0,1,0,1);
+   trans8bit(0,0,0,0,0,1,0,0);
+   trans8bit(0,0,0,0,0,1,0,0);
+   trans8bit(0,0,0,0,0,1,0,0);
+   trans8bit(0,0,0,0,0,1,0,0);
+   trans8bit(0,0,0,0,0,0,0,0);
+}
+
+void initTasten() {
+   /* First set up right modes, which are for each pin one of...
+
+         GPIO_PIN_INPUT      input direction
+         GPIO_PIN_OUTPUT     output direction
+         GPIO_PIN_INOUT      bi-directional
+         GPIO_PIN_OPENDRAIN  open-drain output
+         GPIO_PIN_PUSHPULL   push-pull output
+         GPIO_PIN_TRISTATE   output disabled
+         GPIO_PIN_PULLUP     internal pull-up enabled
+   */
+
+   pinmode(taste1, GPIO_PIN_PUSHPULL);
+   pinmode(taste2, GPIO_PIN_PUSHPULL);
+   pinmode(taste3, GPIO_PIN_PUSHPULL);
+   pinmode(taste4, GPIO_PIN_PUSHPULL);
+
+/* # Hm... das folgende ist irgendwie schwachsinn. Wir lesen,
+   # trotzdem geht es nur wenn eine 1 geschrieben ist. */
+/* # Trotzdem gehts nur so!!! Also da lassen. */
+   pinwrite(taste1, 1);
+   pinwrite(taste2, 1);
+   pinwrite(taste3, 1);
+   pinwrite(taste4, 1);
+}
+
+void writeString (char *str, int cursorposistion, int showcursor) {
+   int j;
+   int strl = strlen(str);
+   for (j = 0; j<80; j++) {
+      int k = j;
+      if (j > 16) k -= 24;
+      if (showcursor && ((k+1) == cursorposistion)) {
+         writeChar('_');
+      } else if (k < strl) {
+         writeChar(str[k]);
+      } else { 
+         writeChar(' ');
+      }
+   }
+}
+
+void writeChar(char mychar) {
+   int k;
+   int feld[129];
+   for (k=128; k != 0; k=k>>1) {
+      int bit;
+      bit = (mychar & k) != 0 ? 1 : 0;
+      feld[k] = bit;
+   }
+   // set pin 20 (rs) to data mode
+   pinwrite(rs, 1);
+   trans8bit(feld[128], feld[64], feld[32], feld[16], feld[8], feld[4], feld[2], feld[1]);
+}
+
+void trans8bit(a, b, c, d, e, f, g, h) {
+    trans4bit(a, b, c, d);
+    trans4bit(e, f, g ,h);
+}
+
+void trans4bit(a, b, c, d) {
+    pinwrite(data0, a);
+    pinwrite(data1, b);
+    pinwrite(data2, c);
+    pinwrite(data3, d);
+    pinwrite(en, 1);
+    pinwrite(en, 0);
+}
+
+void pinmode(pin, flag) {
+   struct gpio_pin_ctl op;
+   bzero(&op, sizeof(op));
+   op.gp_pin = pin;
+   op.gp_flags = flag;
+   if (ioctl(devfd, GPIOPINCTL, &op) == -1) {
+      err(1, "GPIOPINCTL");
+   }
+}
+
+void pinwrite(pin, value) {
+    struct gpio_pin_op op;
+    bzero(&op, sizeof(op));
+    op.gp_pin = pin;
+    op.gp_value = (value == 0 ? GPIO_PIN_LOW : GPIO_PIN_HIGH);
+    if (ioctl(devfd, GPIOPINWRITE, &op) == -1) {
+        err(1, "GPIOPINWRITE");
+   }
+} 
+
+int pinread(int pin) {
+   struct gpio_pin_op op;
+   bzero(&op, sizeof(op));
+   op.gp_pin = pin;
+
+   if (ioctl(devfd, GPIOPINREAD, &op) == -1) {
+       err(1, "GPIOPINWRITE");
+   }
+   return op.gp_value;
+}
+
+int timeChanged(long *last, int seconds) {
+   long jetzt = getTime();
+   if ((*last+seconds) > jetzt) return 0;
+   *last = jetzt;
+   return 1;
+}
+
+long getTime() {
+   struct timeval now;
+   struct timezone zone;
+   bzero(&now, sizeof(now));
+   bzero(&zone, sizeof(zone));
+   if (gettimeofday(&now, &zone)) {
+      err(1, "GETTIMEOFDAY");
+   }
+   return now.tv_sec;
+}
+
